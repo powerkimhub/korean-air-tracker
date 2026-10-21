@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b3a6f">
+<title>대한항공 실시간 위치</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<style>
+:root {
+  --surface: #ffffff;
+  --text: #17202a;
+  --muted: #667380;
+  --line: #e2e6ea;
+  --accent: #0b5cad;
+  --err: #b3261e;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --surface: #1a2027;
+    --text: #e8ecef;
+    --muted: #8a96a3;
+    --line: #2c353f;
+    --accent: #6aaeff;
+    --err: #ff8a80;
+    color-scheme: dark;
+  }
+}
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+html, body { height: 100%; margin: 0; }
+body {
+  font-family: system-ui, -apple-system, "Noto Sans KR", "Malgun Gothic", sans-serif;
+  color: var(--text);
+  background: var(--surface);
+  overflow: hidden;
+}
+#map { position: absolute; inset: 0; }
+#bar {
+  position: absolute; z-index: 1000; left: 10px; right: 10px;
+  top: calc(env(safe-area-inset-top, 0px) + 10px);
+  background: var(--surface); border-radius: 14px; padding: 8px 8px 8px 14px;
+  display: flex; align-items: center; gap: 8px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.25);
+}
+#bar .info { flex: 1; min-width: 0; }
+#bar b { display: block; font-size: 15px; }
+#status { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#status.error { color: var(--err); }
+.ibtn {
+  width: 42px; height: 42px; border: 0; border-radius: 12px; background: transparent; color: var(--accent);
+  display: grid; place-items: center; touch-action: manipulation;
+}
+.ibtn:active { background: var(--line); }
+.ibtn svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.ibtn.spin svg { animation: spin 0.9s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+#sheet {
+  position: absolute; z-index: 1000; left: 0; right: 0; bottom: 0;
+  background: var(--surface); border-radius: 18px 18px 0 0;
+  box-shadow: 0 -2px 12px rgba(0, 0, 0, 0.25);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+  display: flex; flex-direction: column; max-height: 48%;
+}
+#handle {
+  border: 0; background: transparent; color: var(--text); font: inherit; font-size: 14px; font-weight: 600;
+  padding: 12px 16px; display: flex; justify-content: space-between; align-items: center; touch-action: manipulation;
+}
+#handle span { color: var(--muted); font-weight: 400; }
+#list { list-style: none; margin: 0; padding: 0 0 6px; overflow-y: auto; border-top: 1px solid var(--line); }
+#sheet.collapsed #list { display: none; }
+#list li {
+  display: grid; grid-template-columns: 1fr auto; gap: 2px 12px; padding: 10px 16px;
+  border-bottom: 1px solid var(--line); font-size: 14px;
+}
+#list li:active { background: var(--line); }
+#list .sub { color: var(--muted); font-size: 12px; }
+#list .num { text-align: right; font-variant-numeric: tabular-nums; }
+#list .empty { display: block; color: var(--muted); text-align: center; padding: 20px; }
+.plane { filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.5)); }
+.plane svg { display: block; width: 28px; height: 28px; }
+.leaflet-popup-content { margin: 12px 14px; font-family: inherit; }
+.pop h3 { margin: 0 0 6px; font-size: 16px; }
+.pop dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; font-size: 13px; }
+.pop dt { color: #667380; }
+.pop dd { margin: 0; font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="bar">
+  <div class="info"><b>대한항공 실시간 위치</b><div id="status">불러오는 중</div></div>
+  <button class="ibtn" id="fit" aria-label="전체 보기"><svg viewBox="0 0 24 24"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg></button>
+  <button class="ibtn" id="refresh" aria-label="새로고침"><svg viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.4-5.7M20 4v5h-5"/></svg></button>
+</div>
+<div id="sheet" class="collapsed">
+  <button id="handle"><div>운항 목록 <span id="count"></span></div><span id="chev">펼치기</span></button>
+  <ul id="list"></ul>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+(() => {
+  const API_URL = 'https://opensky-network.org/api/states/all';
+  const CALLSIGN_PREFIX = 'KAL';
+  const REFRESH_MS = 60000;
+  const M_TO_FT = 3.28084, MS_TO_KMH = 3.6, MS_TO_FPM = 196.85;
+
+  const $ = id => document.getElementById(id);
+  const map = L.map('map', { zoomControl: false, worldCopyJump: true }).setView([36, 128], 4);
+  L.control.zoom({ position: 'topright' }).addTo(map);
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 18,
+    attribution: '© OpenStreetMap | Flight data: OpenSky Network',
+  }).addTo(map);
+
+  const markers = new Map();
+  let flights = [];
+  let lastLoaded = 0;
+  let loading = false;
+  let firstLoad = true;
+
+  const planeIcon = (deg, onGround) => L.divIcon({
+    className: 'plane',
+    iconSize: [28, 28],
+    iconAnchor: [14, 14],
+    popupAnchor: [0, -12],
+    html: `<svg viewBox="0 0 24 24" style="transform:rotate(${deg}deg)"><path fill="${onGround ? '#8a96a3' : '#0b5cad'}" stroke="#fff" stroke-width="1" d="M12 2c.8 0 1.5.7 1.5 1.5V9l8 5v2l-8-2v4.5l2 1.5V22l-3.5-1L8.5 22v-1.5l2-1.5V14l-8 2v-2l8-5V3.5C10.5 2.7 11.2 2 12 2z"/></svg>`,
+  });
+
+  function toFlight(s) {
+    return {
+      id: s[0],
+      callsign: s[1].trim(),
+      country: s[2],
+      lastContact: s[4],
+      lon: s[5],
+      lat: s[6],
+      baroAlt: s[7],
+      onGround: s[8],
+      speed: s[9],
+      track: s[10] ?? 0,
+      vrate: s[11],
+      geoAlt: s[13],
+    };
+  }
+
+  const altFt = f => {
+    const a = f.geoAlt ?? f.baroAlt;
+    return a == null ? null : Math.round(a * M_TO_FT);
+  };
+  const fmt = n => n.toLocaleString('ko-KR');
+
+  function popupFor(f) {
+    const box = document.createElement('div');
+    box.className = 'pop';
+    const h = document.createElement('h3');
+    h.textContent = f.callsign;
+    const dl = document.createElement('dl');
+    const alt = altFt(f);
+    const rows = [
+      ['상태', f.onGround ? '지상' : '비행 중'],
+      ['고도', alt == null ? '-' : `${fmt(alt)} ft`],
+      ['속도', f.speed == null ? '-' : `${fmt(Math.round(f.speed * MS_TO_KMH))} km/h`],
+      ['방향', `${Math.round(f.track)}°`],
+      ['승강률', f.vrate == null ? '-' : `${fmt(Math.round(f.vrate * MS_TO_FPM))} ft/min`],
+      ['위치', `${f.lat.toFixed(2)}, ${f.lon.toFixed(2)}`],
+      ['신호 수신', new Date(f.lastContact * 1000).toLocaleTimeString('ko-KR')],
+    ];
+    for (const [k, v] of rows) {
+      const dt = document.createElement('dt'); dt.textContent = k;
+      const dd = document.createElement('dd'); dd.textContent = v;
+      dl.append(dt, dd);
+    }
+    box.append(h, dl);
+    return box;
+  }
+
+  function renderMarkers() {
+    const seen = new Set();
+    for (const f of flights) {
+      seen.add(f.id);
+      let m = markers.get(f.id);
+      if (!m) {
+        m = L.marker([f.lat, f.lon], { icon: planeIcon(f.track, f.onGround) }).addTo(map);
+        m.bindPopup(() => popupFor(m._flight));
+        markers.set(f.id, m);
+      } else {
+        m.setLatLng([f.lat, f.lon]);
+        m.setIcon(planeIcon(f.track, f.onGround));
+      }
+      m._flight = f;
+    }
+    for (const [id, m] of markers) {
+      if (!seen.has(id)) { map.removeLayer(m); markers.delete(id); }
+    }
+  }
+
+  function renderList() {
+    const ul = $('list');
+    ul.replaceChildren();
+    $('count').textContent = `${flights.length}편`;
+    if (!flights.length) {
+      const li = document.createElement('li');
+      li.className = 'empty';
+      li.textContent = '현재 수신된 대한항공 항공편이 없습니다';
+      ul.append(li);
+      return;
+    }
+    const sorted = [...flights].sort((a, b) => a.callsign.localeCompare(b.callsign, 'en', { numeric: true }));
+    for (const f of sorted) {
+      const li = document.createElement('li');
+      const left = document.createElement('div');
+      const name = document.createElement('div');
+      name.textContent = f.callsign;
+      const sub = document.createElement('div');
+      sub.className = 'sub';
+      sub.textContent = f.onGround ? '지상' : '비행 중';
+      left.append(name, sub);
+      const right = document.createElement('div');
+      right.className = 'num';
+      const alt = altFt(f);
+      const a = document.createElement('div');
+      a.textContent = alt == null ? '-' : `${fmt(alt)} ft`;
+      const sp = document.createElement('div');
+      sp.className = 'sub';
+      sp.textContent = f.speed == null ? '-' : `${fmt(Math.round(f.speed * MS_TO_KMH))} km/h`;
+      right.append(a, sp);
+      li.append(left, right);
+      li.addEventListener('click', () => {
+        const m = markers.get(f.id);
+        map.flyTo([f.lat, f.lon], Math.max(map.getZoom(), 7));
+        m.openPopup();
+      });
+      ul.append(li);
+    }
+  }
+
+  function setStatus(text, isError) {
+    const el = $('status');
+    el.textContent = text;
+    el.classList.toggle('error', !!isError);
+  }
+
+  function fitAll() {
+    if (!flights.length) return;
+    map.fitBounds(L.latLngBounds(flights.map(f => [f.lat, f.lon])), { padding: [60, 60], maxZoom: 6 });
+  }
+
+  async function load() {
+    if (loading) return;
+    loading = true;
+    $('refresh').classList.add('spin');
+    try {
+      const res = await fetch(API_URL);
+      if (res.status === 429) throw new Error('OpenSky 요청 한도를 초과했습니다. 잠시 후 다시 시도하세요');
+      if (!res.ok) throw new Error(`OpenSky 응답 오류 (HTTP ${res.status})`);
+      const data = await res.json();
+      flights = (data.states || [])
+        .filter(s => s[1] && s[1].trim().startsWith(CALLSIGN_PREFIX) && s[5] != null && s[6] != null)
+        .map(toFlight);
+      lastLoaded = Date.now();
+      renderMarkers();
+      renderList();
+      setStatus(`${flights.length}편 · ${new Date(lastLoaded).toLocaleTimeString('ko-KR')} 갱신`);
+      if (firstLoad) { firstLoad = false; fitAll(); }
+    } catch (e) {
+      setStatus(e.name === 'TypeError' ? '네트워크 오류: OpenSky에 연결할 수 없습니다' : e.message, true);
+    } finally {
+      loading = false;
+      $('refresh').classList.remove('spin');
+    }
+  }
+
+  $('refresh').addEventListener('click', load);
+  $('fit').addEventListener('click', fitAll);
+  $('handle').addEventListener('click', () => {
+    const collapsed = $('sheet').classList.toggle('collapsed');
+    $('chev').textContent = collapsed ? '펼치기' : '접기';
+  });
+  setInterval(() => { if (!document.hidden) load(); }, REFRESH_MS);
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && Date.now() - lastLoaded >= REFRESH_MS) load();
+  });
+
+  load();
+})();
+</script>
+</body>
+</html>
